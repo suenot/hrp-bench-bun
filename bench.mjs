@@ -1,10 +1,15 @@
 /**
- * HRP Benchmark — JavaScript (Node.js / Bun)
+ * HRP Benchmark — Bun
  *
  * Faithful port of the reference C implementation. The synthetic price data is
  * generated with the same 64-bit LCG (via BigInt) so prices — and therefore the
  * resulting HRP weights — are bit-identical across every language in the suite.
  * Generation is NOT timed; only the five HRP stages are.
+ *
+ * The average-linkage stage uses the O(n²) nearest-neighbor chain algorithm
+ * (Müllner 2011), ported directly from the C reference. No external dependencies
+ * are required; the linkage is computed natively to produce bit-identical results
+ * with the C/Python/Node variants of this benchmark.
  */
 
 // ── Synthetic prices: 64-bit LCG (BigInt), identical to the C reference ──
@@ -80,57 +85,104 @@ function distanceMatrix(corr) {
   return d;
 }
 
-// ── Stage 3: average linkage (O(n^3)) ──
+// ── Stage 3: average linkage (O(n²) NN-chain) + leaf-order extraction ──
+//
+// Direct port of the C reference implementation (Müllner 2011 NN-chain with
+// Lance-Williams average update, followed by SciPy-style distance sort and
+// union-find relabeling). Produces a linkage matrix Z identical to the C build,
+// so the resulting leaf order — and therefore HRP weights — are bit-identical.
 
 function averageLinkage(dist) {
   const n = dist.length;
-  const cap = 2 * n;
-  const D = Array.from({ length: cap }, () => new Float64Array(cap).fill(1e18));
-  const active = new Uint8Array(cap);
-  const sizes = new Int32Array(cap);
-  for (let i = 0; i < n; i++) {
-    for (let j = 0; j < n; j++) D[i][j] = dist[i][j];
-    active[i] = 1;
-    sizes[i] = 1;
-  }
-  const Z = [];
-  for (let step = 0; step < n - 1; step++) {
-    let minD = 1e18, mi = 0, mj = 0;
-    for (let i = 0; i < n + step; i++) {
-      if (!active[i]) continue;
-      for (let j = i + 1; j < n + step; j++) {
-        if (!active[j]) continue;
-        if (D[i][j] < minD) { minD = D[i][j]; mi = i; mj = j; }
+  const D = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) D[i * n + j] = dist[i][j];
+
+  const size   = new Int32Array(n).fill(1);
+  const active = new Uint8Array(n).fill(1);
+  const chain  = new Int32Array(n);
+  let clen = 0;
+
+  const rawI = new Int32Array(n - 1);
+  const rawJ = new Int32Array(n - 1);
+  const rawD = new Float64Array(n - 1);
+  const rawS = new Int32Array(n - 1);
+  let m = 0;
+
+  for (let s = 0; s < n - 1; s++) {
+    if (clen === 0) {
+      let start = -1;
+      for (let i = 0; i < n; i++) if (active[i]) { start = i; break; }
+      chain[clen++] = start;
+    }
+    let a, b = -1, mind;
+    for (;;) {
+      a = chain[clen - 1];
+      b = -1; mind = 1e18;
+      if (clen >= 2) { b = chain[clen - 2]; mind = D[a * n + b]; }
+      for (let x = 0; x < n; x++) {
+        if (!active[x] || x === a) continue;
+        const d = D[a * n + x];
+        if (d < mind) { mind = d; b = x; }
       }
+      if (clen >= 2 && b === chain[clen - 2]) break;
+      chain[clen++] = b;
     }
-    const nid = n + step;
-    sizes[nid] = sizes[mi] + sizes[mj];
-    Z.push({ i: mi, j: mj, dist: minD, size: sizes[nid] });
-    for (let k = 0; k < nid; k++) {
-      if (!active[k] || k === mi || k === mj) continue;
-      const nd = (D[mi][k] * sizes[mi] + D[mj][k] * sizes[mj]) / sizes[nid];
-      D[nid][k] = nd;
-      D[k][nid] = nd;
+    clen -= 2;
+    const x = a < b ? a : b, y = a < b ? b : a;
+    const ns = size[x] + size[y];
+    rawI[m] = x; rawJ[m] = y; rawD[m] = mind; rawS[m] = ns; m++;
+    for (let k = 0; k < n; k++) {
+      if (!active[k] || k === x || k === y) continue;
+      const nd = (size[x] * D[x * n + k] + size[y] * D[y * n + k]) / ns;
+      D[y * n + k] = nd; D[k * n + y] = nd;
     }
-    D[nid][nid] = 0;
-    active[mi] = 0;
-    active[mj] = 0;
-    active[nid] = 1;
+    size[y] = ns; active[x] = 0;
   }
-  return Z;
+
+  const idx = Array.from({ length: n - 1 }, (_, i) => i);
+  idx.sort((a, b) => rawD[a] - rawD[b]);
+
+  const parent = new Int32Array(2 * n);
+  const usize  = new Int32Array(2 * n).fill(1);
+  for (let i = 0; i < 2 * n; i++) parent[i] = i;
+
+  function ufFind(x) {
+    let root = x;
+    while (parent[root] !== root) root = parent[root];
+    while (parent[x] !== root) { const nx = parent[x]; parent[x] = root; x = nx; }
+    return root;
+  }
+
+  const Zi = new Int32Array(n - 1);
+  const Zj = new Int32Array(n - 1);
+  const Zd = new Float64Array(n - 1);
+  const Zs = new Int32Array(n - 1);
+  let next = n;
+
+  for (let k = 0; k < n - 1; k++) {
+    const ri = idx[k];
+    const xr = ufFind(rawI[ri]), yr = ufFind(rawJ[ri]);
+    const lo = xr < yr ? xr : yr, hi = xr < yr ? yr : xr;
+    Zi[k] = lo; Zj[k] = hi; Zd[k] = rawD[ri]; Zs[k] = usize[xr] + usize[yr];
+    parent[xr] = next; parent[yr] = next;
+    usize[next] = usize[xr] + usize[yr];
+    next++;
+  }
+  return { Zi, Zj, Zd, Zs };
 }
 
-// ── Leaf order (iterative DFS from root) ──
+function linkageLeafOrder(dist) {
+  const n = dist.length;
+  const { Zi, Zj } = averageLinkage(dist);
 
-function leafOrder(Z, n) {
   const order = [];
   const stack = [n + (n - 2)];
   while (stack.length) {
     const node = stack.pop();
     if (node < n) { order.push(node); continue; }
-    const r = Z[node - n];
-    stack.push(r.j);
-    stack.push(r.i);
+    const k = node - n;
+    stack.push(Zj[k]);
+    stack.push(Zi[k]);
   }
   return order;
 }
@@ -189,10 +241,8 @@ function bench(n, days) {
   const dist = distanceMatrix(corr);
 
   t = performance.now();
-  const Z = averageLinkage(dist);
+  const order = linkageLeafOrder(dist);
   const tLink = (performance.now() - t) * 1000;
-
-  const order = leafOrder(Z, n);
 
   t = performance.now();
   const covQ = order.map((oi) => order.map((oj) => cov[oi][oj]));
@@ -212,9 +262,8 @@ function bench(n, days) {
 
 // ── Main ──
 
-const runtime = typeof Bun !== "undefined" ? "Bun" : "Node.js";
 console.log("╔═══════════════════════════════════════════════════════════════════╗");
-console.log(`║          HRP Benchmark — ${runtime.padEnd(38)}║`);
+console.log("║          HRP Benchmark — Bun                                      ║");
 console.log("╚═══════════════════════════════════════════════════════════════════╝");
 console.log("  365 daily observations per asset\n");
 console.log(
