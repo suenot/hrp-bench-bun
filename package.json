@@ -1,0 +1,8 @@
+{
+  "name": "hrp-bench-bun",
+  "version": "1.0.0",
+  "description": "HRP (Hierarchical Risk Parity) cross-language benchmark — Bun",
+  "type": "module",
+  "scripts": { "bench": "bun bench.mjs" },
+  "license": "MIT"
+}
