@@ -24,6 +24,6 @@ bun bench.mjs        # or: bun run bench
 ## What it measures
 
 Five timed stages on `N` assets × 365 daily observations: log returns O(N·T),
-covariance O(N²·T), average linkage **O(N³, dominates)**, quasi-diagonalization
+covariance **O(N²·T, dominates)**, average linkage O(N²) (NN-chain), quasi-diagonalization
 O(N²), recursive-bisection weights O(N log N). Correlation/distance are computed
 but not timed. Sizes above 4 GB of `N×N` matrix are skipped.
